@@ -1,4 +1,5 @@
 import { connect, StringCodec } from "$nats";
+import { Message } from "../../types/message.ts";
 
 export async function handler(req: Request) {
   if (req.headers.get("upgrade") != "websocket") {
@@ -9,9 +10,9 @@ export async function handler(req: Request) {
 
   const nc = await connect({ servers: "localhost" });
   const js = nc.jetstream();
-  const sc = StringCodec();
+  const consumer = await js.consumers.get("changes");
 
-  const bucket = await js.views.kv("my-bucket", { bindOnly: true });
+  const sc = StringCodec();
 
   const sendData = (data: Uint8Array) => {
     if (socket.OPEN !== 1) {
@@ -22,8 +23,27 @@ export async function handler(req: Request) {
     socket.send(decoded);
   };
 
-  socket.addEventListener("message", (event) => {
-    console.log("received unexpected message from client", event.data);
+  socket.addEventListener("message", async (event) => {
+    console.log("received message", event.data);
+
+    if (typeof event.data !== "string") {
+      throw new Error("received invalid message");
+    }
+
+    const message: Message = JSON.parse(event.data);
+    switch (message.type) {
+      case "increment":
+        console.log("incrementing");
+        break;
+      case "decrement":
+        console.log("decrementing");
+        break;
+      default:
+        throw new Error(`invalid message type: ${message.type}`);
+    }
+
+    const data = JSON.stringify({ type: message.type });
+    await js.publish("changes.events", sc.encode(data));
   });
   socket.addEventListener("close", async () => {
     await nc.close();
@@ -38,18 +58,10 @@ export async function handler(req: Request) {
     // Do nothing
   }
 
-  const iter = await bucket.watch({ key: "start" });
-  for await (const r of iter) {
-    if (r.operation === "DEL") {
-      console.error("key deleted!");
-      return;
-    }
-
-    try {
-      sendData(r.value);
-    } catch (err) {
-      console.error("failed to send message", err);
-    }
+  const messages = await consumer.consume();
+  for await (const msg of messages) {
+    sendData(msg.data);
+    msg.ack();
   }
 
   return response;
